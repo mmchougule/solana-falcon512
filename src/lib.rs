@@ -91,6 +91,10 @@ pub const FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION: u32 = 1;
 /// 8-byte discriminator + 4-byte version + 1024-byte prepared pubkey body.
 pub const FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN: usize = 8 + 4 + FALCON_512_PREPARED_PUBKEY_LEN;
 
+/// Minimum length of a verify instruction payload:
+/// `[signature (666 bytes)][message: variable]`.
+pub const FALCON_512_VERIFY_INSTRUCTION_MIN_LEN: usize = FALCON_512_SIGNATURE_LEN;
+
 pub(crate) const N: usize = 512;
 pub(crate) const Q: u32 = 12289;
 
@@ -502,6 +506,71 @@ impl TryFrom<&[u8]> for Falcon512PreparedPubkey {
     }
 }
 
+/// Borrowed view of a Falcon-512 verify instruction payload.
+///
+/// The canonical layout is:
+///
+/// `[signature (666 bytes)][message: variable length]`
+///
+/// This intentionally matches the minimal bytes shape already used by the
+/// example Solana program, while moving the parser into the shared library so
+/// clients and programs agree on the ABI.
+#[derive(Clone, Copy)]
+pub struct Falcon512VerifyInstruction<'a> {
+    signature: &'a Falcon512Signature,
+    message: &'a [u8],
+}
+
+impl<'a> Falcon512VerifyInstruction<'a> {
+    /// Parse a verify instruction payload.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, ProgramError> {
+        let Some((sig_bytes, message)) = bytes.split_first_chunk::<FALCON_512_SIGNATURE_LEN>()
+        else {
+            return Err(ProgramError::InvalidInstructionData);
+        };
+
+        Ok(Self {
+            signature: Falcon512Signature::from_ref(sig_bytes),
+            message,
+        })
+    }
+
+    /// Construct a borrowed instruction view from its already-parsed pieces.
+    pub const fn new(signature: &'a Falcon512Signature, message: &'a [u8]) -> Self {
+        Self { signature, message }
+    }
+
+    /// Borrow the signature component.
+    pub const fn signature(&self) -> &'a Falcon512Signature {
+        self.signature
+    }
+
+    /// Borrow the message component.
+    pub const fn message(&self) -> &'a [u8] {
+        self.message
+    }
+
+    /// Total encoded length in bytes.
+    pub const fn encoded_len(&self) -> usize {
+        FALCON_512_SIGNATURE_LEN + self.message.len()
+    }
+
+    /// Encode into a caller-provided buffer.
+    ///
+    /// Returns `Err(InvalidInstructionData)` if `out.len()` does not exactly
+    /// match [`encoded_len`](Self::encoded_len).
+    pub fn encode_into(&self, out: &mut [u8]) -> Result<(), ProgramError> {
+        if out.len() != self.encoded_len() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let (sig_out, msg_out) = out.split_at_mut(FALCON_512_SIGNATURE_LEN);
+        sig_out.copy_from_slice(self.signature.as_bytes());
+        msg_out.copy_from_slice(self.message);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod account_format_tests {
     use super::*;
@@ -547,6 +616,34 @@ mod account_format_tests {
             Falcon512PreparedPubkeyAccount::try_from_slice(&misaligned[1..]).is_err(),
             "misaligned account bytes must be rejected"
         );
+    }
+
+    #[test]
+    fn verify_instruction_roundtrip() {
+        let signature = Falcon512Signature::from_bytes([0xAB; FALCON_512_SIGNATURE_LEN]);
+        let message = b"hello falcon account-backed world";
+        let instruction = Falcon512VerifyInstruction::new(&signature, message);
+        let mut bytes = vec![0u8; instruction.encoded_len()];
+
+        instruction.encode_into(&mut bytes).unwrap();
+        let parsed = Falcon512VerifyInstruction::parse(&bytes).unwrap();
+
+        assert_eq!(parsed.signature().as_bytes(), signature.as_bytes());
+        assert_eq!(parsed.message(), message);
+    }
+
+    #[test]
+    fn verify_instruction_rejects_short_input() {
+        assert!(Falcon512VerifyInstruction::parse(&[0u8; FALCON_512_SIGNATURE_LEN - 1]).is_err());
+    }
+
+    #[test]
+    fn verify_instruction_rejects_wrong_output_len() {
+        let signature = Falcon512Signature::from_bytes([0xCD; FALCON_512_SIGNATURE_LEN]);
+        let instruction = Falcon512VerifyInstruction::new(&signature, b"msg");
+        let mut out = vec![0u8; instruction.encoded_len() - 1];
+
+        assert!(instruction.encode_into(&mut out).is_err());
     }
 }
 

@@ -123,6 +123,29 @@ let signature = Falcon512Signature::from_ref(sig_bytes); // borrowed from input
 signature.verify_with_prepared(message, &PREPARED_PUBKEY)
 ```
 
+### Stable verify instruction ABI
+
+The library now exposes a shared parser/encoder for the verifier instruction
+payload via `Falcon512VerifyInstruction`. The canonical bytes layout is still:
+
+`[signature (666 bytes)][message: variable length]`
+
+Use it when you want the client and program side to agree on the exact encoding
+without hand-rolling byte slicing in multiple places:
+
+```rust
+use solana_falcon512::{Falcon512Signature, Falcon512VerifyInstruction, FALCON_512_SIGNATURE_LEN};
+
+let signature = Falcon512Signature::from_bytes([0u8; FALCON_512_SIGNATURE_LEN]);
+let instruction = Falcon512VerifyInstruction::new(&signature, b"hello");
+
+let mut data = vec![0u8; instruction.encoded_len()];
+instruction.encode_into(&mut data)?;
+
+let parsed = Falcon512VerifyInstruction::parse(&data)?;
+assert_eq!(parsed.message(), b"hello");
+```
+
 ## Compatibility
 
 | Variant                                | Supported |
@@ -172,9 +195,9 @@ signature in place via `Falcon512Signature::from_ref`:
 
 | Path                                 | CUs            |
 | ------------------------------------ | -------------- |
-| `verify_with_prepared` (success)     | ~186241        |
-| `verify_with_prepared` (rejection)   | ~186281–186306 |
-| `verify_with_prepared` via account   | ~186445        |
+| `verify_with_prepared` (success)     | ~186253        |
+| `verify_with_prepared` (rejection)   | ~186294–186319 |
+| `verify_with_prepared` via account   | ~186461        |
 | `verify` (raw pubkey)                | ~270k          |
 
 The small CU spread on the prepared path reflects per-signature variance
@@ -228,6 +251,7 @@ The e2e tests include:
 
 - `prepared_pubkey_roundtrip_matches_direct_verify` for the raw 1024-byte prepared form
 - `prepared_pubkey_account_roundtrip_matches_direct_verify` for the versioned account wrapper
+- `Falcon512VerifyInstruction` roundtrips and malformed payload rejection
 - Mollusk program tests for both baked-in and account-backed verification paths
 
 ### Regenerating the example keypair

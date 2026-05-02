@@ -1,7 +1,9 @@
 use mollusk_svm::Mollusk;
 use solana_account::Account;
 use solana_address::Address;
-use solana_falcon512::{Falcon512PreparedPubkeyAccount, Falcon512Pubkey};
+use solana_falcon512::{
+    Falcon512PreparedPubkeyAccount, Falcon512Pubkey, Falcon512Signature, Falcon512VerifyInstruction,
+};
 use solana_instruction::{AccountMeta, Instruction};
 
 const SIG_LEN: usize = 666;
@@ -14,9 +16,12 @@ const SIG: [u8; SIG_LEN] = *include_bytes!("fixtures/sample_sig.bin");
 const MSG: &[u8] = b"deterministic falcon-512 verify benchmark";
 
 fn build_ix_data(sig: [u8; SIG_LEN], msg: &[u8]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(SIG_LEN + msg.len());
-    data.extend_from_slice(&sig);
-    data.extend_from_slice(msg);
+    let signature = Falcon512Signature::from(sig);
+    let instruction = Falcon512VerifyInstruction::new(&signature, msg);
+    let mut data = vec![0u8; instruction.encoded_len()];
+    instruction
+        .encode_into(&mut data)
+        .expect("instruction buffer should match encoded len");
     data
 }
 
@@ -151,6 +156,23 @@ fn rejects_invalid_prepared_pubkey_account_header() {
     assert!(
         result.program_result.is_err(),
         "expected failure on malformed prepared-pubkey account, got: {:?}",
+        result.program_result
+    );
+}
+
+#[test]
+fn rejects_truncated_instruction_data() {
+    let (mollusk, program_id) = make_mollusk();
+    let ix = Instruction {
+        program_id,
+        accounts: vec![],
+        data: vec![0u8; SIG_LEN - 1],
+    };
+
+    let result = mollusk.process_instruction(&ix, &[]);
+    assert!(
+        result.program_result.is_err(),
+        "expected failure on truncated instruction payload, got: {:?}",
         result.program_result
     );
 }

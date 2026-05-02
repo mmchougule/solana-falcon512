@@ -1,7 +1,7 @@
 use solana_account_info::{next_account_info, AccountInfo};
 use solana_falcon512::{
-    Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount, Falcon512Pubkey, Falcon512Signature,
-    FALCON_512_SIGNATURE_LEN,
+    Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount, Falcon512Pubkey,
+    Falcon512VerifyInstruction,
 };
 use solana_program_entrypoint::entrypoint_no_alloc;
 use solana_program_entrypoint::ProgramResult;
@@ -34,10 +34,6 @@ fn map_falcon_error(err: FalconProgramError) -> EntryProgramError {
 
 /// Solana SBF example verifier.
 ///
-/// Instruction data layout:
-///
-/// `[signature (666 bytes)][message: variable]`
-///
 /// Account layout:
 ///
 /// - zero accounts: verify against the compile-time `PREPARED_PUBKEY`
@@ -48,22 +44,13 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    if instruction_data.len() < FALCON_512_SIGNATURE_LEN {
-        return Err(EntryProgramError::InvalidInstructionData);
-    }
-
-    let Some((sig_bytes, message)) =
-        instruction_data.split_first_chunk::<FALCON_512_SIGNATURE_LEN>()
-    else {
-        return Err(EntryProgramError::InvalidInstructionData);
-    };
-
-    // Borrow the signature in place — `from_ref` is a no-op cast (no copy)
-    // since `Falcon512Signature` is `#[repr(transparent)]`.
-    let signature = Falcon512Signature::from_ref(sig_bytes);
+    let instruction =
+        Falcon512VerifyInstruction::parse(instruction_data).map_err(map_falcon_error)?;
 
     let verified = if accounts.is_empty() {
-        signature.verify_with_prepared(message, &PREPARED_PUBKEY)
+        instruction
+            .signature()
+            .verify_with_prepared(instruction.message(), &PREPARED_PUBKEY)
     } else {
         if accounts.len() != 1 {
             return Err(EntryProgramError::InvalidArgument);
@@ -80,7 +67,9 @@ pub fn process_instruction(
         let prepared_data = prepared_account.try_borrow_data()?;
         let prepared_account = Falcon512PreparedPubkeyAccount::try_from_slice(&prepared_data)
             .map_err(map_falcon_error)?;
-        signature.verify_with_prepared(message, prepared_account.prepared_pubkey())
+        instruction
+            .signature()
+            .verify_with_prepared(instruction.message(), prepared_account.prepared_pubkey())
     };
 
     if verified {
