@@ -1,10 +1,13 @@
-#![cfg_attr(any(target_arch = "bpf", target_os = "solana"), no_std)]
-
+use solana_account_info::{next_account_info, AccountInfo};
 use solana_falcon512::{
-    FALCON_512_SIGNATURE_LEN, Falcon512PreparedPubkey, Falcon512Pubkey, Falcon512Signature,
+    Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount, Falcon512Pubkey, Falcon512Signature,
+    FALCON_512_SIGNATURE_LEN,
 };
-
-use solana_program_error::ProgramError;
+use solana_program_entrypoint::entrypoint_no_alloc;
+use solana_program_entrypoint::ProgramResult;
+use solana_program_error::ProgramError as FalconProgramError;
+use solana_program_error_legacy::ProgramError as EntryProgramError;
+use solana_pubkey::Pubkey;
 
 // Prepared (decoded + NTT-transformed) pubkey, computed at compile time so the
 // program skips the per-call pubkey decode + forward NTT.
@@ -13,55 +16,76 @@ pub const PREPARED_PUBKEY: Falcon512PreparedPubkey = {
     pk.prepare_pubkey()
 };
 
-#[cfg(any(target_arch = "bpf", target_os = "solana"))]
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
+entrypoint_no_alloc!(process_instruction);
 
 /// Custom program error returned when signature verification fails.
-const ERR_VERIFY_FAILED: u64 = 3;
+const ERR_VERIFY_FAILED: u32 = 3;
 
-/// Solana SBF entrypoint.
-///
-/// The runtime calls this with `r1 = input`, where `input` points to the
-/// serialized account + instruction region. With zero accounts the layout is:
-///
-/// ```text
-///   [u64 num_accounts = 0]      // bytes 0..8
-///   [u64 ix_data_len]           // bytes 8..16
-///   [ix_data: ix_data_len bytes]// bytes 16..16+ix_data_len
-///   [program_id: 32 bytes]      // trailing
-/// ```
-///
-/// We read the instruction-data slice directly from `input + 16` rather than
-/// going through any deserializer.
-///
-/// **Instruction data layout:** `[signature (666 bytes)][message: variable]`.
-///
-/// # Safety
-///
-/// The Solana runtime guarantees `input` points to a properly-laid-out
-/// serialized region with at least `16 + ix_data_len` bytes readable.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn entrypoint(input: *mut u8) -> u64 {
-    let ix_data_len = unsafe { core::ptr::read(input.add(8) as *const u64) } as usize;
-    if ix_data_len < FALCON_512_SIGNATURE_LEN {
-        return ProgramError::InvalidInstructionData.into();
+fn map_falcon_error(err: FalconProgramError) -> EntryProgramError {
+    match err {
+        FalconProgramError::InvalidArgument => EntryProgramError::InvalidArgument,
+        FalconProgramError::InvalidInstructionData => EntryProgramError::InvalidInstructionData,
+        FalconProgramError::AccountBorrowFailed => EntryProgramError::AccountBorrowFailed,
+        FalconProgramError::ArithmeticOverflow => EntryProgramError::ArithmeticOverflow,
+        FalconProgramError::Custom(code) => EntryProgramError::Custom(code),
+        _ => EntryProgramError::InvalidArgument,
     }
-    let data = unsafe { core::slice::from_raw_parts(input.add(16), ix_data_len) };
+}
 
-    let Some((sig_bytes, message)) = data.split_first_chunk::<FALCON_512_SIGNATURE_LEN>() else {
-        return ProgramError::InvalidInstructionData.into();
+/// Solana SBF example verifier.
+///
+/// Instruction data layout:
+///
+/// `[signature (666 bytes)][message: variable]`
+///
+/// Account layout:
+///
+/// - zero accounts: verify against the compile-time `PREPARED_PUBKEY`
+/// - one readonly account: interpret account data as a
+///   `Falcon512PreparedPubkeyAccount` and verify against it
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    if instruction_data.len() < FALCON_512_SIGNATURE_LEN {
+        return Err(EntryProgramError::InvalidInstructionData);
+    }
+
+    let Some((sig_bytes, message)) =
+        instruction_data.split_first_chunk::<FALCON_512_SIGNATURE_LEN>()
+    else {
+        return Err(EntryProgramError::InvalidInstructionData);
     };
+
     // Borrow the signature in place — `from_ref` is a no-op cast (no copy)
-    // since `Falcon512Signature` is `#[repr(transparent)]`. Saves ~200 CU
-    // vs `Falcon512Signature::from(*sig_bytes)` which memcpy's 666 bytes.
+    // since `Falcon512Signature` is `#[repr(transparent)]`.
     let signature = Falcon512Signature::from_ref(sig_bytes);
 
-    if signature.verify_with_prepared(message, &PREPARED_PUBKEY) {
-        0
+    let verified = if accounts.is_empty() {
+        signature.verify_with_prepared(message, &PREPARED_PUBKEY)
     } else {
-        ERR_VERIFY_FAILED
+        if accounts.len() != 1 {
+            return Err(EntryProgramError::InvalidArgument);
+        }
+        let mut accounts_iter = accounts.iter();
+        let prepared_account = next_account_info(&mut accounts_iter)
+            .map_err(|_| EntryProgramError::NotEnoughAccountKeys)?;
+        if prepared_account.owner != program_id {
+            return Err(EntryProgramError::IncorrectProgramId);
+        }
+        if prepared_account.is_writable {
+            return Err(EntryProgramError::InvalidArgument);
+        }
+        let prepared_data = prepared_account.try_borrow_data()?;
+        let prepared_account = Falcon512PreparedPubkeyAccount::try_from_slice(&prepared_data)
+            .map_err(map_falcon_error)?;
+        signature.verify_with_prepared(message, prepared_account.prepared_pubkey())
+    };
+
+    if verified {
+        Ok(())
+    } else {
+        Err(EntryProgramError::Custom(ERR_VERIFY_FAILED))
     }
 }
