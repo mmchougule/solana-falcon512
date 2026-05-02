@@ -1,9 +1,9 @@
 use pqcrypto_falcon::falcon512;
 use pqcrypto_traits::sign::{DetachedSignature, PublicKey};
 use solana_falcon512::{
-    Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount, Falcon512Pubkey, Falcon512Signature,
     FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN, FALCON_512_PREPARED_PUBKEY_LEN, FALCON_512_PUBKEY_LEN,
-    FALCON_512_SIGNATURE_LEN,
+    FALCON_512_SIGNATURE_LEN, Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount,
+    Falcon512Pubkey, Falcon512Signature,
 };
 
 fn sign_with_pqclean(msg: &[u8]) -> ([u8; FALCON_512_PUBKEY_LEN], [u8; FALCON_512_SIGNATURE_LEN]) {

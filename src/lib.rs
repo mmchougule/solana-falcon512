@@ -337,7 +337,7 @@ impl Falcon512PreparedPubkey {
             .map_err(|_| ProgramError::InvalidArgument)?;
         // Alignment check — `from_ref` requires 2-byte alignment for the
         // u16 reinterpret.
-        if (array.as_ptr() as usize) % core::mem::align_of::<u16>() != 0 {
+        if !(array.as_ptr() as usize).is_multiple_of(core::mem::align_of::<u16>()) {
             return Err(ProgramError::InvalidArgument);
         }
         // SAFETY: length matches (`try_into` succeeded) and alignment
@@ -414,6 +414,26 @@ pub struct Falcon512PreparedPubkeyAccount {
     prepared: Falcon512PreparedPubkey,
 }
 
+// Pin the on-chain layout at compile time. The Solana program ABI guarantees
+// account data is 8-byte aligned, so the wrapper's alignment must stay ≤ 8 for
+// `try_from_slice` to succeed against any account read; if a future field
+// reordering bumps it past 8 (e.g. by adding a `u64` field that would change
+// `repr(C)` alignment), the build fails here rather than silently breaking
+// every `try_from_slice` caller at runtime.
+const _: () = assert!(
+    core::mem::size_of::<Falcon512PreparedPubkeyAccount>()
+        == FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN,
+    "Falcon512PreparedPubkeyAccount size drifted from FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN",
+);
+const _: () = assert!(
+    core::mem::align_of::<Falcon512PreparedPubkeyAccount>() <= 8,
+    "Falcon512PreparedPubkeyAccount alignment exceeds Solana's 8-byte account-data guarantee",
+);
+const _: () = assert!(
+    core::mem::align_of::<Falcon512PreparedPubkey>() == core::mem::align_of::<u16>(),
+    "Falcon512PreparedPubkey must stay 2-byte aligned for the from_ref u16 reinterpret",
+);
+
 impl Falcon512PreparedPubkeyAccount {
     /// Construct the canonical version-1 account wrapper for a prepared
     /// Falcon-512 pubkey.
@@ -441,7 +461,7 @@ impl Falcon512PreparedPubkeyAccount {
         let array: &[u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN] = value
             .try_into()
             .map_err(|_| ProgramError::InvalidArgument)?;
-        if (array.as_ptr() as usize) % core::mem::align_of::<Self>() != 0 {
+        if !(array.as_ptr() as usize).is_multiple_of(core::mem::align_of::<Self>()) {
             return Err(ProgramError::InvalidArgument);
         }
 

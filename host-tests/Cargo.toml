@@ -1,7 +1,7 @@
 [package]
 name = "host-tests"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 # This crate exists only to host integration tests for `solana-falcon512`
@@ -18,4 +18,5 @@ solana-falcon512 = { path = ".." }
 [dev-dependencies]
 pqcrypto-falcon = "0.4"
 pqcrypto-traits = "0.3"
+proptest = "1"
 rayon = "1"

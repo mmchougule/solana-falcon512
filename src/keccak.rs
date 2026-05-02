@@ -212,7 +212,7 @@ impl Shake256 {
         let len = data.len();
 
         // Phase 1: byte-by-byte until lane-aligned.
-        while i < len && self.pos % 8 != 0 {
+        while i < len && !self.pos.is_multiple_of(8) {
             let lane = self.pos / 8;
             let shift = 8 * (self.pos % 8);
             self.state[lane] ^= (data[i] as u64) << shift;
