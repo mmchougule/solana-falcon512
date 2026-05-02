@@ -81,6 +81,16 @@ pub const FALCON_512_SIGNATURE_LEN: usize = 666;
 /// CU penalty.
 pub const FALCON_512_PREPARED_PUBKEY_LEN: usize = N * 2;
 
+/// Account-format discriminator for [`Falcon512PreparedPubkeyAccount`].
+pub const FALCON_512_PREPARED_PUBKEY_ACCOUNT_DISCRIMINATOR: [u8; 8] = *b"FALCPPK1";
+
+/// Version number for [`Falcon512PreparedPubkeyAccount`].
+pub const FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION: u32 = 1;
+
+/// Serialised length of a [`Falcon512PreparedPubkeyAccount`]:
+/// 8-byte discriminator + 4-byte version + 1024-byte prepared pubkey body.
+pub const FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN: usize = 8 + 4 + FALCON_512_PREPARED_PUBKEY_LEN;
+
 pub(crate) const N: usize = 512;
 pub(crate) const Q: u32 = 12289;
 
@@ -323,7 +333,7 @@ impl Falcon512PreparedPubkey {
             .map_err(|_| ProgramError::InvalidArgument)?;
         // Alignment check — `from_ref` requires 2-byte alignment for the
         // u16 reinterpret.
-        if !(array.as_ptr() as usize).is_multiple_of(core::mem::align_of::<u16>()) {
+        if (array.as_ptr() as usize) % core::mem::align_of::<u16>() != 0 {
             return Err(ProgramError::InvalidArgument);
         }
         // SAFETY: length matches (`try_into` succeeded) and alignment
@@ -376,6 +386,111 @@ impl Falcon512PreparedPubkey {
     }
 }
 
+/// Solana account wrapper for a prepared Falcon-512 pubkey.
+///
+/// This gives programs a stable on-chain layout for the "prepare once, verify
+/// many times" flow:
+///
+/// - `8` bytes of discriminator to identify the account type
+/// - `4` bytes of version for forward-compatible upgrades
+/// - `1024` bytes of prepared pubkey payload
+///
+/// The payload is the same byte representation returned by
+/// [`Falcon512PreparedPubkey::as_bytes`], so consumers can:
+///
+/// 1. decode a wire pubkey once via [`Falcon512Pubkey::try_prepare_pubkey`];
+/// 2. store it as a `Falcon512PreparedPubkeyAccount` in account data; and
+/// 3. later borrow it zero-copy and feed it directly into
+///    [`Falcon512Signature::verify_with_prepared`].
+#[derive(Clone, Eq, PartialEq)]
+#[repr(C)]
+pub struct Falcon512PreparedPubkeyAccount {
+    discriminator: [u8; 8],
+    version: u32,
+    prepared: Falcon512PreparedPubkey,
+}
+
+impl Falcon512PreparedPubkeyAccount {
+    /// Construct the canonical version-1 account wrapper for a prepared
+    /// Falcon-512 pubkey.
+    pub const fn new(prepared: Falcon512PreparedPubkey) -> Self {
+        Self {
+            discriminator: FALCON_512_PREPARED_PUBKEY_ACCOUNT_DISCRIMINATOR,
+            version: FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION,
+            prepared,
+        }
+    }
+
+    /// Borrow a fixed-size account buffer as a prepared-pubkey account.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must satisfy the alignment requirement of
+    /// `Falcon512PreparedPubkeyAccount` (currently 4 bytes).
+    pub const unsafe fn from_ref(bytes: &[u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN]) -> &Self {
+        unsafe { &*(bytes as *const [u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN] as *const Self) }
+    }
+
+    /// Parse a byte slice as a prepared-pubkey account and validate its
+    /// discriminator, version, length, and alignment.
+    pub fn try_from_slice(value: &[u8]) -> Result<&Falcon512PreparedPubkeyAccount, ProgramError> {
+        let array: &[u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN] = value
+            .try_into()
+            .map_err(|_| ProgramError::InvalidArgument)?;
+        if (array.as_ptr() as usize) % core::mem::align_of::<Self>() != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let account = unsafe { Self::from_ref(array) };
+        if account.discriminator != FALCON_512_PREPARED_PUBKEY_ACCOUNT_DISCRIMINATOR {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if account.version != FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        Ok(account)
+    }
+
+    /// Decode an owned byte buffer into a prepared-pubkey account, validating
+    /// the discriminator and version fields.
+    pub fn from_bytes(
+        bytes: [u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN],
+    ) -> Result<Self, ProgramError> {
+        if bytes[..8] != FALCON_512_PREPARED_PUBKEY_ACCOUNT_DISCRIMINATOR {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let version = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if version != FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        let mut prepared_bytes = [0u8; FALCON_512_PREPARED_PUBKEY_LEN];
+        prepared_bytes.copy_from_slice(&bytes[12..]);
+
+        Ok(Self {
+            discriminator: FALCON_512_PREPARED_PUBKEY_ACCOUNT_DISCRIMINATOR,
+            version,
+            prepared: Falcon512PreparedPubkey::from_bytes(prepared_bytes),
+        })
+    }
+
+    /// Borrow the wrapped prepared pubkey.
+    pub const fn prepared_pubkey(&self) -> &Falcon512PreparedPubkey {
+        &self.prepared
+    }
+
+    /// Serialise into the canonical account byte layout.
+    pub fn to_bytes(&self) -> [u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN] {
+        let mut out = [0u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN];
+        out[..8].copy_from_slice(&self.discriminator);
+        out[8..12].copy_from_slice(&self.version.to_le_bytes());
+        out[12..].copy_from_slice(self.prepared.as_bytes());
+        out
+    }
+}
+
 impl TryFrom<&[u8]> for Falcon512PreparedPubkey {
     type Error = ProgramError;
 
@@ -384,6 +499,54 @@ impl TryFrom<&[u8]> for Falcon512PreparedPubkey {
             .try_into()
             .map_err(|_| ProgramError::InvalidArgument)?;
         Ok(Self::from_bytes(bytes))
+    }
+}
+
+#[cfg(test)]
+mod account_format_tests {
+    use super::*;
+
+    const TEST_PUBKEY: Falcon512Pubkey =
+        Falcon512Pubkey::from_bytes(*include_bytes!("../program/tests/fixtures/falcon.pk"));
+
+    #[test]
+    fn prepared_pubkey_account_rejects_wrong_version() {
+        let prepared = TEST_PUBKEY.prepare_pubkey();
+        let account = Falcon512PreparedPubkeyAccount::new(prepared);
+        let mut bytes = account.to_bytes();
+        bytes[8..12]
+            .copy_from_slice(&(FALCON_512_PREPARED_PUBKEY_ACCOUNT_VERSION + 1).to_le_bytes());
+
+        assert!(
+            Falcon512PreparedPubkeyAccount::from_bytes(bytes).is_err(),
+            "wrong version must be rejected"
+        );
+    }
+
+    #[test]
+    fn prepared_pubkey_account_try_from_slice_rejects_truncated_input() {
+        let prepared = TEST_PUBKEY.prepare_pubkey();
+        let account = Falcon512PreparedPubkeyAccount::new(prepared);
+        let bytes = account.to_bytes();
+
+        assert!(
+            Falcon512PreparedPubkeyAccount::try_from_slice(&bytes[..bytes.len() - 1]).is_err(),
+            "truncated input must be rejected"
+        );
+    }
+
+    #[test]
+    fn prepared_pubkey_account_try_from_slice_rejects_misaligned_input() {
+        let prepared = TEST_PUBKEY.prepare_pubkey();
+        let account = Falcon512PreparedPubkeyAccount::new(prepared);
+        let bytes = account.to_bytes();
+        let mut misaligned = vec![0u8; FALCON_512_PREPARED_PUBKEY_ACCOUNT_LEN + 1];
+        misaligned[1..].copy_from_slice(&bytes);
+
+        assert!(
+            Falcon512PreparedPubkeyAccount::try_from_slice(&misaligned[1..]).is_err(),
+            "misaligned account bytes must be rejected"
+        );
     }
 }
 

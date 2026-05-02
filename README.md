@@ -7,6 +7,9 @@ Pure-Rust **Falcon-512 signature verification**, optimised for Solana SBF progra
 - **~173–183k compute units per verify** on Solana SBF with a prepared pubkey
   (rejection sampling is not constant-time — see [Benchmarks](#benchmarks)).
 - Zero-copy borrow APIs (`from_ref`, `try_from_slice`) so signatures and prepared pubkeys can be verified directly from runtime input / account data with no memcpy.
+- A versioned Solana account wrapper for prepared pubkeys, so multi-tenant
+  programs can standardize account-backed verification instead of inventing
+  their own bytes layout.
 - Prepared pubkey storage: **1024 bytes** (one u16 per NTT coefficient, since each value is `< Q < 2^14`).
 - Cross-checked against NIST SHAKE-256 KATs and 1,000,000 PQClean-generated signatures with zero failures.
 
@@ -45,9 +48,10 @@ the pubkey isn't known at compile time — store the **prepared** form on-chain
 instead of the raw 897-byte wire encoding. Each verify then loads the NTT-form
 pubkey directly and skips the ~99k-CU decode + forward NTT.
 
-The trade-off is 1024 bytes of account data instead of 897 bytes (about
-127 bytes extra rent per account). Anything that gets verified multiple times
-recoups that cost easily in saved compute.
+The trade-off is 1024 bytes of prepared coefficients, or **1036 bytes** if you
+wrap them in the crate's versioned `Falcon512PreparedPubkeyAccount`
+account format (8-byte discriminator + 4-byte version). Anything that gets
+verified multiple times recoups that rent cost easily in saved compute.
 
 For runtime preparation, `prepare_pubkey()`'s `const` form would `panic!` on a
 malformed wire pubkey — fine at compile time (becomes a build error), but
@@ -59,25 +63,38 @@ with `Err(InvalidArgument)` on header / coefficient / trailing-bit issues.
 
 ```rust
 use solana_falcon512::{
-    Falcon512PreparedPubkey, Falcon512Pubkey, Falcon512Signature,
-    FALCON_512_PREPARED_PUBKEY_LEN,
+    Falcon512PreparedPubkey, Falcon512PreparedPubkeyAccount, Falcon512Pubkey,
+    Falcon512Signature,
 };
 
-// On registration: prepare once, write the 1024-byte form into the account.
-// Either of these forms works:
+// On registration: prepare once, wrap it in the canonical Solana account
+// layout, and write that account body on-chain.
 let pk = Falcon512Pubkey::try_from(&pk_wire_bytes[..])?;
 let prepared: Falcon512PreparedPubkey = (&pk).try_into()?;        // TryFrom
 // or, equivalently:
 let prepared = pk.try_prepare_pubkey()?;                            // method
-account_data.copy_from_slice(prepared.as_bytes());
+let account = Falcon512PreparedPubkeyAccount::new(prepared);
+account_data.copy_from_slice(&account.to_bytes());
 
-// On verify: borrow the prepared pubkey directly out of account data — no
-// copy, no allocation. `try_from_slice` validates length + 2-byte alignment
-// (Solana account data is 8-byte aligned by ABI, so this always passes).
-let prepared = Falcon512PreparedPubkey::try_from_slice(&account_data[..])?;
+// On verify: borrow the prepared pubkey directly out of the account wrapper —
+// no copy, no allocation. `try_from_slice` validates discriminator, version,
+// length, and alignment.
+let prepared_account = Falcon512PreparedPubkeyAccount::try_from_slice(&account_data[..])?;
 let signature = Falcon512Signature::try_from_slice(sig_bytes)?;
-let ok = signature.verify_with_prepared(message, prepared);
+let ok = signature.verify_with_prepared(message, prepared_account.prepared_pubkey());
 ```
+
+### Solana account-backed verifier pattern
+
+The example program in `program/` now supports both:
+
+- zero accounts: verify against a compile-time prepared pubkey baked into the binary
+- one readonly, program-owned account: verify against a `Falcon512PreparedPubkeyAccount`
+
+That makes the example useful for the real multi-tenant flow Solana programs
+actually need: register a Falcon pubkey once, store its prepared form in a PDA,
+then verify many signatures later by passing only the signature, message, and
+prepared-key account.
 
 ### Zero-copy borrow APIs
 
@@ -143,8 +160,9 @@ intentional. The 897-byte standard wire pubkey is still the
 interoperability boundary — accept it via [`Falcon512Pubkey::try_from`],
 prepare once with [`Falcon512Pubkey::try_prepare_pubkey`] (or the `const`
 panicking [`Falcon512Pubkey::prepare_pubkey`] for compile-time keys), and
-store the result. The 127-byte rent overhead (1024 vs 897) amortises over
-many verifications throughout the lifetime of the pubkey.
+store the result. If you want a stable PDA layout instead of raw bytes, wrap
+the prepared key in [`Falcon512PreparedPubkeyAccount`] and pay a further
+12-byte metadata overhead for discriminator + versioning.
 
 ## Benchmarks
 
@@ -154,17 +172,18 @@ signature in place via `Falcon512Signature::from_ref`:
 
 | Path                                 | CUs            |
 | ------------------------------------ | -------------- |
-| `verify_with_prepared` (success)     | ~173k–183k     |
-| `verify_with_prepared` (rejection)   | ~173k–183k     |
+| `verify_with_prepared` (success)     | ~186241        |
+| `verify_with_prepared` (rejection)   | ~186281–186306 |
+| `verify_with_prepared` via account   | ~186445        |
 | `verify` (raw pubkey)                | ~270k          |
 
-The CU range for `verify_with_prepared` reflects per-signature variance
+The small CU spread on the prepared path reflects per-signature variance
 in `hash_to_point`: each Falcon signature embeds a fresh random nonce, and
 SHAKE-256 rejection sampling in `hash_to_point` consumes a variable number
 of permutations depending on how many `< 5q` candidates land in each
 absorbed block (typically 8–10 permutations, ~95% of the variance). The
 algorithm work is identical; only the keccak count differs. A safe
-compute-unit budget for the prepared path is
+compute-unit budget for either prepared path is
 `set_compute_unit_limit(195_000)`.
 
 Notable points along the optimisation curve (start of the journey vs. now,
@@ -191,8 +210,8 @@ Notable points along the optimisation curve (start of the journey vs. now,
 - `host-tests/` — separate crate hosting the integration tests
   (e2e / fuzz / soak) so the main crate doesn't pull in `pqcrypto-falcon`,
   `rayon`, etc. as dev-deps.
-- `program/` — minimal Solana program demonstrating in-program verification
-  with a baked-in prepared pubkey.
+- `program/` — Solana example verifier supporting both baked-in and
+  account-backed prepared pubkeys.
 - `program/tests/` — Mollusk SBF tests against the actual `.so`.
 
 ## Testing
@@ -205,10 +224,11 @@ cargo test --workspace --release -- --ignored       # 100k-iter soak (~40s),
 (cd program && cargo test-sbf)                      # SBF tests via Mollusk
 ```
 
-The e2e tests include a `prepared_pubkey_roundtrip_matches_direct_verify`
-case that prepares a pubkey at runtime, serialises via `as_bytes`,
-deserialises via `from_bytes`, and confirms `verify_with_prepared` agrees
-with direct `verify` for valid signatures and rejects for tampered ones.
+The e2e tests include:
+
+- `prepared_pubkey_roundtrip_matches_direct_verify` for the raw 1024-byte prepared form
+- `prepared_pubkey_account_roundtrip_matches_direct_verify` for the versioned account wrapper
+- Mollusk program tests for both baked-in and account-backed verification paths
 
 ### Regenerating the example keypair
 

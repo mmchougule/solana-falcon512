@@ -1,7 +1,7 @@
 [package]
 name = "solana-falcon512"
 version = "0.1.2"
-edition = "2024"
+edition = "2021"
 description = "Pure-Rust Falcon-512 signature verification, optimised for Solana SBF programs."
 repository = "https://github.com/blueshift-gg/solana-falcon512"
 license = "MIT"
